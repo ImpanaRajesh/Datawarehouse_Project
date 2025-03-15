@@ -4,6 +4,7 @@ The goal is to integrate diverse F1 datasets, transform them into a dimensional 
 The project is divided into the following phases:
 
 1)Data Sourcing
+
 2)Normalized Database Design
 3)ETL Implementation
 4)Dimensional Modeling
