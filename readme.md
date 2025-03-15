@@ -1,4 +1,5 @@
 Overview
+
 This project involves designing and implementing a data warehousing solution for Formula 1 (F1) racing data.
 The goal is to integrate diverse F1 datasets, transform them into a dimensional model, and demonstrate analytical capabilities through meaningful queries and visualizations. 
 
