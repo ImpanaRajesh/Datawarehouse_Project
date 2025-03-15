@@ -1,0 +1,449 @@
+-- use sysadmin role
+USE ROLE SYSADMIN;
+
+--Creating and using the database
+CREATE DATABASE F1_DATA_WAREHOUSE;
+USE DATABASE F1_DATA_WAREHOUSE;
+
+--Creatimg Schema for staging, creating dimensions and facts
+CREATE SCHEMA STAGING;
+CREATE SCHEMA DIMENSIONS;
+CREATE SCHEMA FACTS;
+
+--Creating a Warehouse
+CREATE WAREHOUSE F1_WH WITH WAREHOUSE_SIZE = 'XSMALL' AUTO_SUSPEND = 300 AUTO_RESUME = TRUE;
+USE WAREHOUSE F1_WH;
+
+-- Creating a Stage to Load the data from the computer
+CREATE OR REPLACE STAGE STAGING.RAW_STAGE;
+
+--Uploading all the files from the computer
+LIST @STAGING.RAW_STAGE;
+
+--Creating tables in the STAGING schema to hold the raw data
+--Creating table for Circuits.csv file
+CREATE OR REPLACE TABLE STAGING.CIRCUITS (
+circuitId INT,
+circuitRef STRING,
+name STRING,
+location STRING,
+country STRING,
+lat DECIMAL(9,6),
+lng DECIMAL(9,6),
+alt INT,
+url STRING
+);
+
+--Loading the data onto the CIRCUITS table created in the staging schema
+COPY INTO STAGING.CIRCUITS FROM @STAGING.RAW_STAGE/circuits.csv FILE_FORMAT = (TYPE = CSV SKIP_HEADER = 1) ON_ERROR = CONTINUE;
+
+--Creating table for Constructors.csv file
+CREATE OR REPLACE TABLE STAGING.CONSTRUCTORS (
+constructorId INT,
+constructorRef STRING,
+name STRING,
+nationality STRING,
+url STRING
+);
+
+--Loading the data onto the CONSTRUCTORS table created in the staging schema
+COPY INTO STAGING.CONSTRUCTORS FROM @STAGING.RAW_STAGE/constructors.csv FILE_FORMAT = (TYPE = CSV SKIP_HEADER = 1) ON_ERROR = CONTINUE;
+
+
+--Creating table for Drivers.csv file
+CREATE OR REPLACE TABLE STAGING.DRIVERS (
+driverId INT,
+driverRef STRING,
+number INT,
+code STRING,
+forename STRING,
+surname STRING,
+dob DATE,
+nationality STRING,
+url STRING
+);
+
+--Loading the data onto the DRIVERS table created in the staging schema
+COPY INTO STAGING.DRIVERS FROM @STAGING.RAW_STAGE/drivers.csv FILE_FORMAT = (TYPE = CSV SKIP_HEADER = 1 FIELD_OPTIONALLY_ENCLOSED_BY = '"' DATE_FORMAT = 'YYYY-MM-DD') ON_ERROR = CONTINUE;
+
+--Creating table for Races.csv file
+CREATE OR REPLACE TABLE STAGING.RACES (
+raceId INT,
+year INT,
+round INT,
+circuitId INT,
+name STRING,
+date DATE,
+time STRING,
+url STRING
+);
+
+
+--Loading the data onto the RACES table created in the staging schema
+COPY INTO STAGING.RACES
+(raceId, year, round, circuitId, name, date, time, url) -- Specifying target columns
+FROM @STAGING.RAW_STAGE/races.csv
+FILE_FORMAT = (
+TYPE = CSV
+SKIP_HEADER = 1
+FIELD_OPTIONALLY_ENCLOSED_BY = '"'
+DATE_FORMAT = 'YYYY-MM-DD'
+)
+ON_ERROR = CONTINUE;
+
+--Creating table for Results.csv file
+CREATE OR REPLACE TABLE STAGING.RESULTS (
+resultId INT,
+raceId INT,
+driverId INT,
+constructorId INT,
+number INT,
+grid INT,
+position INT,
+positionText STRING,
+positionOrder INT,
+points FLOAT
+);
+
+--Loading the data onto the RESULTS table created in the staging schema
+COPY INTO STAGING.RESULTS (resultId, raceId, driverId, constructorId, number, grid, position, positionText, positionOrder, points)
+FROM (
+SELECT
+$1, -- resultId
+$2, -- raceId
+$3, -- driverId
+$4, -- constructorId
+$5, -- number
+$6, -- grid
+$7, -- position
+$8, -- positionText
+$9, -- positionOrder
+$10 -- points
+FROM @STAGING.RAW_STAGE/results.csv
+)
+FILE_FORMAT = (TYPE = CSV SKIP_HEADER = 1)
+ON_ERROR = CONTINUE;
+
+--Creating table for Qualifying.csv file
+CREATE OR REPLACE TABLE STAGING.QUALIFYING (
+qualifyId INT,
+raceId INT,
+driverId INT,
+constructorId INT,
+number INT,
+position INT,
+q1 STRING,
+q2 STRING,
+q3 STRING
+);
+
+--Loading the data onto the QUALIFYING table created in the staging schema
+COPY INTO STAGING.QUALIFYING FROM @STAGING.RAW_STAGE/qualifying.csv FILE_FORMAT = (TYPE = CSV SKIP_HEADER = 1) ON_ERROR = CONTINUE;
+
+
+--Creating Dimensional Model
+--Dimension Tables
+--Circuit Dimension Table
+CREATE OR REPLACE TABLE DIMENSIONS.DIM_CIRCUITS (
+circuit_sk INT AUTOINCREMENT PRIMARY KEY,
+circuitId INT UNIQUE,
+name STRING,
+location STRING,
+country STRING,
+lat DECIMAL(9,6),
+lng DECIMAL(9,6),
+alt INT,
+url STRING
+);
+
+--Populating Circuit Dimensional Table (SCD TYpe -1)
+MERGE INTO DIMENSIONS.DIM_CIRCUITS AS target
+USING STAGING.CIRCUITS AS source
+ON target.circuitId = source.circuitId
+WHEN MATCHED THEN
+UPDATE SET
+name = source.name,
+location = source.location,
+country = source.country,
+lat = source.lat,
+lng = source.lng,
+alt = source.alt
+WHEN NOT MATCHED THEN
+INSERT (circuitId, name, location, country, lat, lng, alt, url)
+VALUES (source.circuitId, source.name, source.location, source.country, source.lat, source.lng, source.alt, source.url);
+
+
+--Constructors Dimension Table
+CREATE OR REPLACE TABLE DIMENSIONS.DIM_CONSTRUCTORS (
+constructor_sk INT AUTOINCREMENT PRIMARY KEY, -- Surrogate Key
+constructorId INT UNIQUE, -- Natural Key
+name STRING,
+nationality STRING,
+url STRING,
+valid_from DATE DEFAULT CURRENT_DATE,
+valid_to DATE DEFAULT NULL,
+is_current BOOLEAN DEFAULT TRUE
+);
+
+--Populating Constructors Dimensional Table (SCD TYpe -2)
+MERGE INTO DIMENSIONS.DIM_CONSTRUCTORS AS target
+USING STAGING.CONSTRUCTORS AS source
+ON target.constructorId = source.constructorId AND target.is_current = TRUE
+WHEN MATCHED AND (
+target.name <> source.name OR
+target.nationality <> source.nationality
+) THEN
+UPDATE SET target.valid_to = CURRENT_DATE - 1, target.is_current = FALSE
+WHEN NOT MATCHED THEN
+INSERT (constructorId, name, nationality, url, valid_from)
+VALUES (source.constructorId, source.name, source.nationality, source.url, CURRENT_DATE);
+
+
+--Drivers Dimension Table
+CREATE OR REPLACE TABLE DIMENSIONS.DIM_DRIVERS (
+driver_sk INT AUTOINCREMENT PRIMARY KEY, -- Surrogate Key
+driverId INT UNIQUE, -- Natural Key
+driverRef STRING,
+full_name STRING,
+dob DATE,
+nationality STRING,
+url STRING,
+valid_from DATE DEFAULT CURRENT_DATE, -- Start date for SCD
+valid_to DATE DEFAULT NULL, -- End date for SCD
+is_current BOOLEAN DEFAULT TRUE -- Marks active records
+);
+
+
+--Populating Drivers Dimensional Table (SCD TYpe -2)
+MERGE INTO DIMENSIONS.DIM_DRIVERS AS target
+USING STAGING.DRIVERS AS source
+ON target.driverId = source.driverId AND target.is_current = TRUE
+WHEN MATCHED AND (
+target.full_name <> CONCAT(source.forename, ' ', source.surname) OR
+target.nationality <> source.nationality
+) THEN
+UPDATE SET target.valid_to = CURRENT_DATE - 1, target.is_current = FALSE
+WHEN NOT MATCHED THEN
+INSERT (driverId, driverRef, full_name, dob, nationality, url, valid_from)
+VALUES (source.driverId, source.driverRef, CONCAT(source.forename, ' ', source.surname), source.dob, source.nationality, source.url, CURRENT_DATE);
+
+
+--Races Dimension Table
+CREATE OR REPLACE TABLE DIMENSIONS.DIM_RACES (
+race_sk INT AUTOINCREMENT PRIMARY KEY, -- Surrogate Key
+raceId INT UNIQUE, -- Natural Key
+year INT,
+round INT,
+circuitId INT,
+name STRING,
+race_date DATE,
+race_time STRING,
+url STRING
+);
+
+
+--Populating Races Dimensional Table (SCD TYpe -1)
+MERGE INTO DIMENSIONS.DIM_RACES AS target
+USING STAGING.RACES AS source
+ON target.raceId = source.raceId
+WHEN MATCHED THEN
+UPDATE SET
+year = source.year,
+round = source.round,
+circuitId = source.circuitId,
+name = source.name,
+race_date = source.date,
+race_time = source.time,
+url = source.url
+WHEN NOT MATCHED THEN
+INSERT (raceId, year, round, circuitId, name, race_date, race_time, url)
+VALUES (source.raceId, source.year, source.round, source.circuitId, source.name, source.date, source.time, source.url);
+
+
+--Fact Tabels
+--Results Fact Table
+CREATE OR REPLACE TABLE FACTS.FACT_RESULTS (
+result_sk INT AUTOINCREMENT PRIMARY KEY, -- Surrogate key
+resultId INT,
+race_sk INT REFERENCES DIMENSIONS.DIM_RACES(race_sk),
+driver_sk INT REFERENCES DIMENSIONS.DIM_DRIVERS(driver_sk),
+constructor_sk INT REFERENCES DIMENSIONS.DIM_CONSTRUCTORS(constructor_sk),
+number INT,
+grid INT,
+position INT,
+positionText STRING,
+positionOrder INT,
+points FLOAT
+);
+
+--Populating Results Fact Table
+INSERT INTO FACTS.FACT_RESULTS (resultId, race_sk, driver_sk, constructor_sk, number, grid, position, positionText, positionOrder, points)
+SELECT r.resultId, dr.race_sk, dd.driver_sk, dc.constructor_sk, r.number, r.grid, r.position, r.positionText, r.positionOrder, r.points
+FROM STAGING.RESULTS r
+JOIN DIMENSIONS.DIM_RACES dr ON r.raceId = dr.raceId
+JOIN DIMENSIONS.DIM_DRIVERS dd ON r.driverId = dd.driverId
+JOIN DIMENSIONS.DIM_CONSTRUCTORS dc ON r.constructorId = dc.constructorId;
+
+
+--Qulaifying Fact Table
+CREATE OR REPLACE TABLE FACTS.FACT_QUALIFYING (
+qualify_sk INT AUTOINCREMENT PRIMARY KEY, -- Surrogate key
+qualifyId INT,
+race_sk INT REFERENCES DIMENSIONS.DIM_RACES(race_sk),
+driver_sk INT REFERENCES DIMENSIONS.DIM_DRIVERS(driver_sk),
+constructor_sk INT REFERENCES DIMENSIONS.DIM_CONSTRUCTORS(constructor_sk),
+number INT,
+position INT,
+q1 STRING,
+q2 STRING,
+q3 STRING
+);
+
+--Populating Qulaifying Fact Table
+INSERT INTO FACTS.FACT_QUALIFYING (qualifyId,race_sk,driver_sk,constructor_sk,number,position,q1,q2,q3)
+SELECT q.qualifyId,dr.race_sk, dd.driver_sk, dc.constructor_sk, q.number,q.position,q.q1,q.q2,q.q3
+FROM STAGING.QUALIFYING q
+JOIN DIMENSIONS.DIM_RACES dr ON q.raceId = dr.raceId -- Join to get race_sk
+JOIN DIMENSIONS.DIM_DRIVERS dd ON q.driverId = dd.driverId -- Join to get driver_sk
+JOIN DIMENSIONS.DIM_CONSTRUCTORS dc ON q.constructorId = dc.constructorId; -- Join to get constructor_sk
+
+
+
+--Analytical Queries
+--1. Top 10 Drivers by Total Points
+SELECT
+dd.full_name AS driver_name,
+SUM(fr.points) AS total_points
+FROM FACTS.FACT_RESULTS fr
+JOIN DIMENSIONS.DIM_DRIVERS dd ON fr.driver_sk = dd.driver_sk
+GROUP BY dd.full_name
+ORDER BY total_points DESC
+LIMIT 10;
+
+--2. Races with the Most Overtakes (Grid Position vs. Final Position)
+SELECT
+dr.name AS race_name,
+dr.race_date,
+dd.full_name AS driver_name,
+(fr.grid - fr.position) AS overtakes
+FROM FACTS.FACT_RESULTS fr
+JOIN DIMENSIONS.DIM_RACES dr ON fr.race_sk = dr.race_sk
+JOIN DIMENSIONS.DIM_DRIVERS dd ON fr.driver_sk = dd.driver_sk
+WHERE fr.grid > fr.position
+ORDER BY overtakes DESC
+LIMIT 10;
+
+--3.Total Points Earned by Each Constructor in a Specific Year
+SELECT
+dc.name AS constructor_name,
+SUM(fr.points) AS total_points
+FROM FACTS.FACT_RESULTS fr
+JOIN DIMENSIONS.DIM_CONSTRUCTORS dc ON fr.constructor_sk = dc.constructor_sk
+JOIN DIMENSIONS.DIM_RACES dr ON fr.race_sk = dr.race_sk
+WHERE dr.year = 2022 -- Filter for a specific year
+GROUP BY dc.name
+ORDER BY total_points DESC;
+
+--4.Average Finishing Position of Drivers by Nationality
+SELECT
+dd.nationality,
+AVG(fr.position) AS avg_finishing_position
+FROM FACTS.FACT_RESULTS fr
+JOIN DIMENSIONS.DIM_DRIVERS dd ON fr.driver_sk = dd.driver_sk
+GROUP BY dd.nationality
+ORDER BY avg_finishing_position ASC;
+
+--5.Most Consistent Drivers (Lowest Standard Deviation in Finishing Positions)
+SELECT
+dd.full_name AS driver_name,
+STDDEV(fr.position) AS position_stddev
+FROM FACTS.FACT_RESULTS fr
+JOIN DIMENSIONS.DIM_DRIVERS dd ON fr.driver_sk = dd.driver_sk
+GROUP BY dd.full_name
+HAVING COUNT(*) > 10 -- Only consider drivers with more than 10 races
+ORDER BY position_stddev ASC;
+
+--6.Average Points per Race by Constructor
+SELECT
+dc.name AS constructor_name,
+AVG(fr.points) AS avg_points_per_race
+FROM FACTS.FACT_RESULTS fr
+JOIN DIMENSIONS.DIM_CONSTRUCTORS dc ON fr.constructor_sk = dc.constructor_sk
+GROUP BY dc.name
+ORDER BY avg_points_per_race DESC;
+
+--7.Drivers with the Most Fastest Laps
+SELECT
+dd.full_name AS driver_name,
+COUNT(*) AS fastest_laps
+FROM FACTS.FACT_RESULTS fr
+JOIN DIMENSIONS.DIM_DRIVERS dd ON fr.driver_sk = dd.driver_sk
+WHERE fr.positionOrder = 1 -- Assuming positionOrder = 1 indicates fastest lap
+GROUP BY dd.full_name
+ORDER BY fastest_laps DESC
+LIMIT 10;
+
+--8.Most Improved Drivers (Year-over-Year Points Growth)
+WITH DriverYearlyPoints AS (
+SELECT
+dd.full_name AS driver_name,
+dr.year,
+SUM(fr.points) AS total_points
+FROM FACTS.FACT_RESULTS fr
+JOIN DIMENSIONS.DIM_RACES dr ON fr.race_sk = dr.race_sk
+JOIN DIMENSIONS.DIM_DRIVERS dd ON fr.driver_sk = dd.driver_sk
+GROUP BY dd.full_name, dr.year
+)
+SELECT
+driver_name,
+MAX(total_points) - MIN(total_points) AS points_growth
+FROM DriverYearlyPoints
+GROUP BY driver_name
+ORDER BY points_growth DESC
+LIMIT 10;
+
+--9.Qualifying Performance vs. Race Performance for Drivers
+WITH QualifyingPerformance AS (
+SELECT
+fq.driver_sk,
+AVG(fq.position) AS avg_qualifying_position
+FROM FACTS.FACT_QUALIFYING fq
+WHERE fq.position IS NOT NULL -- Exclude NULL qualifying positions
+GROUP BY fq.driver_sk
+),
+RacePerformance AS (
+SELECT
+fr.driver_sk,
+AVG(fr.position) AS avg_race_position
+FROM FACTS.FACT_RESULTS fr
+WHERE fr.position IS NOT NULL -- Exclude NULL race positions
+GROUP BY fr.driver_sk
+)
+SELECT
+dd.full_name AS driver_name,
+qp.avg_qualifying_position,
+rp.avg_race_position,
+abs(rp.avg_race_position - qp.avg_qualifying_position) AS performance_difference
+FROM QualifyingPerformance qp
+JOIN RacePerformance rp ON qp.driver_sk = rp.driver_sk
+JOIN DIMENSIONS.DIM_DRIVERS dd ON qp.driver_sk = dd.driver_sk
+WHERE qp.avg_qualifying_position IS NOT NULL -- Ensure no NULL values in final result
+AND rp.avg_race_position IS NOT NULL
+ORDER BY performance_difference DESC;
+
+--10.Circuits with the Most Diverse Winners
+SELECT
+dc.name AS circuit_name,
+COUNT(DISTINCT fr.driver_sk) AS unique_winners
+FROM FACTS.FACT_RESULTS fr
+JOIN DIMENSIONS.DIM_RACES dr ON fr.race_sk = dr.race_sk
+JOIN DIMENSIONS.DIM_CIRCUITS dc ON dr.circuitId = dc.circuitId
+WHERE fr.position = 1 -- Only consider race winners
+GROUP BY dc.name
+ORDER BY unique_winners DESC;
+
+
+
+
+
+
